@@ -1,264 +1,139 @@
-# mer/simulate_dialogue.py
+"""
+mer/simulate_dialogue.py
 
+Loads metadata CSV (with state_path), projects states with pre-fit PCA (models/pca_states_2.pkl),
+builds a compact prompt (valence, label, z_proj, short history), calls OpenAI (if OPENAI_API_KEY set)
+or a safe stub, and writes simulation_outputs.csv with columns:
+
+dialogue_id, utt_id, text, label, valence, action, z_x, z_y, reply
+
+Usage (from project root):
+python mer/simulate_dialogue.py --metadata_csv data/processed/meld_text_audio_video_arcface_states.csv --pca_path models/pca_states_2.pkl --out simulation_outputs.csv
+"""
 import os
+import csv
 import argparse
-from typing import Optional
+from typing import List, Optional
 
+import numpy as np
 import pandas as pd
-import torch
+import joblib
 
-from .env_meld_jitai import LABEL2VALENCE, label_to_valence
-from .train_jitai_policy import JITAIPolicyNet
+def load_pca(pca_path: str):
+    if not os.path.exists(pca_path):
+        raise FileNotFoundError(pca_path)
+    return joblib.load(pca_path)
 
-
-def load_policy(project_root: str, device: torch.device) -> JITAIPolicyNet:
-    """
-    Load the trained JITAI policy network from checkpoints_jitai/jitai_policy_best.pt
-    """
-    ckpt_path = os.path.join(project_root, "checkpoints_jitai", "jitai_policy_best.pt")
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Could not find JITAI checkpoint at {ckpt_path}. "
-            "Make sure you ran train_jitai_policy.py first."
-        )
-
-    ckpt = torch.load(ckpt_path, map_location=device)
-    state_dim = ckpt["state_dim"]
-
-    policy = JITAIPolicyNet(state_dim=state_dim)
-    policy.load_state_dict(ckpt["model_state_dict"])
-    policy.to(device)
-    policy.eval()
-
-    print(f"[simulate_dialogue] Loaded JITAI policy from {ckpt_path}")
-    print(f"[simulate_dialogue] State dim = {state_dim}")
-    return policy
-
-
-def pick_dialogue(
-    df: pd.DataFrame,
-    split: str,
-    dialogue_id: Optional[int] = None,
-) -> int:
-    """
-    Choose a Dialogue_ID to simulate.
-    If dialogue_id is None, pick the first dialogue in the given split
-    that has at least one non-null state_path.
-    """
-    df_split = df[df["split"] == split]
-
-    if dialogue_id is not None:
-        if dialogue_id not in df_split["Dialogue_ID"].unique():
-            raise ValueError(
-                f"Dialogue_ID {dialogue_id} not found in split='{split}'."
-            )
-        return dialogue_id
-
-    # auto-pick: first dialogue with at least one state_path
-    for d_id, df_d in df_split.groupby("Dialogue_ID"):
-        if df_d["state_path"].notna().any():
-            print(f"[simulate_dialogue] Auto-selected Dialogue_ID={d_id} in split='{split}'")
-            return int(d_id)
-
-    raise RuntimeError(f"No dialogues with state_path found in split='{split}'.")
-
-
-def build_llm_prompt(
-    user_text: str,
-    emotion_label: str,
-    valence: float,
-    action: int,
-) -> str:
-    """
-    Construct a prompt you would send to an LLM.
-    This DOES NOT actually call an LLM – it just returns the prompt string.
-    """
-
-    action_str = "offer a supportive, empathic response" if action == 1 else \
-                 "respond briefly and neutrally without attempting an intervention"
-
-    # You can tweak this template however you like for the thesis/demo.
-    prompt = f"""
-You are an empathic mental health support assistant.
-
-The user's current utterance:
-\"\"\"{user_text}\"\"\"
-
-Detected emotion label: {emotion_label}
-Mapped valence: {valence:+.1f}
-
-JITAI policy action (0 = no intervention, 1 = supportive intervention): {action}
-
-Your task: {action_str}.
-
-Guidelines:
-- Be concise (2–4 sentences).
-- Be non-judgmental and validating.
-- Do NOT give medical diagnoses.
-- If you suggest actions, keep them small and practical.
-
-Now write your reply to the user.
-""".strip()
-
+def build_small_prompt(text: str, label: str, valence: float, zproj: np.ndarray, action: int, history: List[str]) -> str:
+    h = ""
+    if history:
+        h = "\nConversation history (recent):\n" + "\n".join(history[-3:])
+    prompt = f"""You are an empathic mental-health support assistant.
+User utterance: "{text}"
+Detected emotion: {label} (valence={valence})
+Affective projection: x={zproj[0]:.3f}, y={zproj[1]:.3f}
+Policy action: {action}  (0=no-action, 1=intervene)
+{h}
+Task: Provide a concise (2-4 sentence) supportive reply. No diagnoses. If action==1, validate and give one practical suggestion.
+Safety: If the user expresses self-harm or imminent danger, include a short escalation phrase and do NOT give instructions for self-harm.
+"""
     return prompt
 
-
-def simulate_dialogue(
-    csv_path: str,
-    split: str = "test",
-    dialogue_id: Optional[int] = None,
-    max_turns: Optional[int] = None,
-    device: str = "cpu",
-):
-    device = torch.device(device)
-
-    # --------------------------------------------------------
-    # Load CSV with states
-    # --------------------------------------------------------
-    df = pd.read_csv(csv_path)
-
-    if "state_path" not in df.columns:
-        raise ValueError(
-            "CSV does not contain 'state_path'. "
-            "Run extract_tav_context_states.py first."
+def call_openai_chat(prompt: str, model: str = "gpt-4o-mini", temperature: float = 0.7, api_key: Optional[str] = None) -> str:
+    # If openai is available and API key set, call it; otherwise return a safe stub
+    try:
+        import openai
+        if api_key is None:
+            api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY not set")
+        openai.api_key = api_key
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role":"system","content":"You are an empathic assistant."},
+                      {"role":"user","content":prompt}],
+            temperature=temperature,
+            max_tokens=150
         )
+        return resp["choices"][0]["message"]["content"].strip()
+    except Exception:
+        # deterministic, safe stub reply
+        return ("Thanks for sharing that — I’m sorry you’re going through this. "
+                "If you can, try a short grounding exercise (5 deep breaths) and consider "
+                "one small action right now, e.g., stepping outside for two minutes.")
 
-    # --------------------------------------------------------
-    # Resolve project_root and load policy
-    # --------------------------------------------------------
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(this_dir)
-    policy = load_policy(project_root, device)
+def simulate(metadata_csv: str, pca_path: str, out_csv: str, max_rows: Optional[int] = None):
+    print("Loading metadata CSV:", metadata_csv)
+    df = pd.read_csv(metadata_csv)
+    print("Rows in CSV:", len(df))
+    pca = load_pca(pca_path)
+    print("Loaded PCA:", pca)
 
-    # --------------------------------------------------------
-    # Pick dialogue to simulate
-    # --------------------------------------------------------
-    d_id = pick_dialogue(df, split=split, dialogue_id=dialogue_id)
+    # Prepare output file
+    header = ["dialogue_id","utt_id","text","label","valence","action","z_x","z_y","reply"]
+    with open(out_csv, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
 
-    df_d = df[(df["split"] == split) & (df["Dialogue_ID"] == d_id)].copy()
-    df_d = df_d.sort_values("Utterance_ID").reset_index(drop=True)
-
-    print(f"\n[simulate_dialogue] Simulating Dialogue_ID={d_id}, split='{split}'")
-    print(f"Total utterances in dialogue: {len(df_d)}")
-    print(f"Utterances with state_path: {df_d['state_path'].notna().sum()}")
-
-    print("\n================= SIMULATED DIALOGUE =================\n")
-
-    num_turns = 0
-    for _, row in df_d.iterrows():
-        speaker = row.get("speaker", "Unknown")
-        text = str(row.get("text", ""))
-        label = str(row.get("label", "neutral"))
-
-        print(f"Utterance {int(row['Utterance_ID'])} | Speaker: {speaker}")
-        print(f"USER: {text}")
-        print(f"  (MELD label: {label})")
-
-        if pd.isna(row["state_path"]):
-            print("  [No state_path available → skipping JITAI / LLM for this turn]\n")
-            continue
-
-        # ----------------------------------------------------
-        # Load z_t state vector
-        # ----------------------------------------------------
-        state_path = row["state_path"]
-        try:
-            z_t = torch.from_numpy(
-                __import__("numpy").load(state_path)
-            ).float().to(device)
-        except Exception as e:
-            print(f"  [WARN] Failed to load state from {state_path}: {e}")
-            print("  [Skipping JITAI / LLM for this turn]\n")
-            continue
-
-        if z_t.ndim > 1:
-            z_t = z_t.view(-1)
-
-        # ----------------------------------------------------
-        # Compute valence and JITAI action
-        # ----------------------------------------------------
-        val = label_to_valence(label)
-        with torch.no_grad():
-            logits = policy(z_t.unsqueeze(0))   # [1, 2]
-            action = int(logits.argmax(dim=-1).item())
-
-        action_name = "no intervention (0)" if action == 0 else "supportive intervention (1)"
-        print(f"  → Valence: {val:+.1f}, JITAI policy action: {action_name}")
-
-        # ----------------------------------------------------
-        # Build LLM prompt (not actually calling an LLM here)
-        # ----------------------------------------------------
-        prompt = build_llm_prompt(
-            user_text=text,
-            emotion_label=label,
-            valence=val,
-            action=action,
-        )
-
-        print("\n  --- LLM PROMPT (for debugging / inspection) ---")
-        print(prompt)
-        print("  --- END PROMPT ---")
-
-        # Dummy placeholder instead of real LLM call:
-        print("ASSISTANT (dummy): [LLM-generated supportive reply would appear here.]\n")
-
-        num_turns += 1
-        if max_turns is not None and num_turns >= max_turns:
-            print(f"[simulate_dialogue] Reached max_turns={max_turns}, stopping.")
+    dialogue_history = {}
+    processed = 0
+    for idx, row in df.iterrows():
+        if max_rows is not None and processed >= max_rows:
             break
 
-    print("\n================= END OF SIMULATION =================\n")
+        # adapt column names (try multiple common names)
+        dlg = row.get("Dialogue_ID", row.get("dialogue_id", row.get("dialog_id", "dlg")))
+        utt = row.get("Utterance_ID", row.get("utt_id", row.get("utt", idx)))
+        text = row.get("text", row.get("utterance", ""))
+        label = row.get("label", "")
+        valence = float(row.get("valence", 0.0)) if "valence" in row.index else 0.0
+        action = int(row.get("action", 0)) if "action" in row.index else 0
+        state_path = row.get("state_path", "")
 
+        if dlg not in dialogue_history:
+            dialogue_history[dlg] = []
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Simulate a MELD dialogue with MER state + JITAI policy + LLM prompt."
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="test",
-        choices=["train", "dev", "test"],
-        help="Which split to sample dialogue from (default: test).",
-    )
-    parser.add_argument(
-        "--dialogue-id",
-        type=int,
-        default=None,
-        help="Specific Dialogue_ID to simulate (default: auto-select one with states).",
-    )
-    parser.add_argument(
-        "--max-turns",
-        type=int,
-        default=None,
-        help="Optional maximum number of utterances to simulate.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help="Device for policy network (e.g., 'cpu' or 'cuda').",
-    )
-    return parser.parse_args()
+        # load z (safe)
+        if isinstance(state_path, str) and state_path and os.path.exists(state_path):
+            try:
+                z = np.load(state_path).ravel()
+            except Exception:
+                z = np.zeros(pca.components_.shape[1], dtype=np.float32)
+        else:
+            z = np.zeros(pca.components_.shape[1], dtype=np.float32)
 
+        # ensure z length matches PCA expected dim
+        expected_dim = pca.components_.shape[1]
+        if z.size < expected_dim:
+            z2 = np.zeros(expected_dim, dtype=np.float32)
+            z2[:z.size] = z
+            z = z2
+        elif z.size > expected_dim:
+            z = z[:expected_dim]
+
+        zproj = pca.transform(z.reshape(1,-1))[0]
+
+        prompt = build_small_prompt(text, label, valence, zproj, action, dialogue_history[dlg])
+        reply = call_openai_chat(prompt)
+
+        # record
+        dialogue_history[dlg].append(f"U: {text}\nA: {reply}")
+
+        with open(out_csv, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow([dlg, utt, text, label, valence, action, float(zproj[0]), float(zproj[1]), reply])
+
+        processed += 1
+        if processed % 500 == 0:
+            print("Processed:", processed)
+
+    print("Simulation finished. Wrote:", out_csv)
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(this_dir)
-
-    csv_path = os.path.join(
-        project_root,
-        "data",
-        "processed",
-        "meld_text_audio_video_arcface_states.csv",
-    )
-
-    simulate_dialogue(
-        csv_path=csv_path,
-        split=args.split,
-        dialogue_id=args.dialogue_id,
-        max_turns=args.max_turns,
-        device=args.device,
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--metadata_csv", type=str, default="data/processed/meld_text_audio_video_arcface_states.csv")
+    parser.add_argument("--pca_path", type=str, default="models/pca_states_2.pkl")
+    parser.add_argument("--out", type=str, default="simulation_outputs.csv")
+    parser.add_argument("--max_rows", type=int, default=None)
+    args = parser.parse_args()
+    simulate(args.metadata_csv, args.pca_path, args.out, max_rows=args.max_rows)
