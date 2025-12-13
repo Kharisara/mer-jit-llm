@@ -1,189 +1,140 @@
-# mer/train_jitai_policy.py
+"""
+Train a small JITAI policy on the offline transitions using a 1-step policy-gradient.
 
+Usage:
+python mer/train_jitai_policy.py \
+  --csv data/processed/meld_text_audio_video_arcface_states.csv \
+  --out_model models/jitai_policy.pt \
+  --epochs 10 --batch_size 64 --lr 1e-4 --device cpu
+
+Notes:
+- This is a simple starting point. It treats each logged transition as a 1-step
+  episode with reward = valence_{t+1} - valence_t (already in dataset).
+- Because the dataset used a synthetic logging policy, use these results for
+  debugging and policy initialization. For production you should incorporate
+  offline-offpolicy evaluation (IPS/DR) and safety checks.
+"""
 import os
+import argparse
+from collections import deque
 
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score, accuracy_score  # <-- FIXED: added accuracy_score
 
-from .env_meld_jitai import MELDJITAITransitionDataset
+from mer.env_meld_jitai import MELDJITAITransitionDataset
 
-
-class JITAIPolicyNet(nn.Module):
-    """
-    Simple MLP policy:
-      input: state (e.g., 512-d from TAV+context)
-      output: logits over 2 actions (0 = no intervention, 1 = intervene)
-    """
-
-    def __init__(self, state_dim: int, hidden_dim: int = 256, num_actions: int = 2):
+class MLPPolicy(nn.Module):
+    def __init__(self, state_dim: int, hidden: int = 256, n_actions: int = 2):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+            nn.Linear(state_dim, hidden),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, num_actions),
+            nn.Linear(hidden, n_actions),
         )
 
-    def forward(self, state):
-        return self.net(state)  # [B, num_actions]
+    def forward(self, x):
+        logits = self.net(x)
+        return logits
 
+    def act_probs(self, x):
+        logits = self.forward(x)
+        return torch.softmax(logits, dim=-1)
 
-def main():
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(this_dir)
+def collate_batch(batch):
+    # batch: list of dicts from dataset.__getitem__
+    states = torch.stack([b["state"].float() for b in batch], dim=0)
+    actions = torch.tensor([int(b["action"].item()) if hasattr(b["action"], "item") else int(b["action"]) for b in batch], dtype=torch.long)
+    rewards = torch.tensor([float(b["reward"].item()) if hasattr(b["reward"], "item") else float(b["reward"]) for b in batch], dtype=torch.float32)
+    return states, actions, rewards
 
-    csv_path = os.path.join(
-        project_root, "data", "processed", "meld_text_audio_video_arcface_states.csv"
-    )
-    ckpt_dir = os.path.join(project_root, "checkpoints_jitai")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    best_ckpt_path = os.path.join(ckpt_dir, "jitai_policy_best.pt")
+def train(args):
+    ds = MELDJITAITransitionDataset(csv_path=args.csv, splits=("train",), device=args.device)
+    print("Dataset transitions:", len(ds), "state_dim:", ds.state_dim)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_batch, drop_last=False, num_workers=0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
-    print("CSV:", csv_path)
+    device = torch.device(args.device)
+    policy = MLPPolicy(state_dim=ds.state_dim, hidden=args.hidden).to(device)
+    optimizer = optim.Adam(policy.parameters(), lr=args.lr)
+    # moving baseline for reward
+    baseline = 0.0
+    baseline_deque = deque(maxlen=1000)
 
-    # --------------------------------------------------------
-    # Datasets
-    # --------------------------------------------------------
-    # TRAIN on train + dev transitions (we just want more data)
-    train_ds = MELDJITAITransitionDataset(
-        csv_path=csv_path,
-        splits=("train", "dev"),
-        device=str(device),
-    )
-    # VALIDATE on test transitions
-    dev_ds = MELDJITAITransitionDataset(
-        csv_path=csv_path,
-        splits=("test",),
-        device=str(device),
-    )
+    for epoch in range(1, args.epochs + 1):
+        total_loss = 0.0
+        total_samples = 0
+        total_reward = 0.0
+        action_counts = torch.zeros(2, dtype=torch.long)
 
-    if train_ds.state_dim == 0 or len(train_ds) == 0:
-        raise RuntimeError(
-            "No transitions found for train splits. "
-            "Check that state_path is populated and extract_tav_context_states.py ran correctly."
-        )
+        policy.train()
+        for states, actions, rewards in loader:
+            states = states.to(device)
+            actions = actions.to(device)
+            rewards = rewards.to(device)
 
-    print("Train transitions:", len(train_ds))
-    print("Dev transitions:  ", len(dev_ds))
-    print("State dim:        ", train_ds.state_dim)
+            probs = policy.act_probs(states)  # [B, 2]
+            dist = torch.distributions.Categorical(probs=probs)
 
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
-    dev_loader = DataLoader(dev_ds, batch_size=8, shuffle=False)
+            # compute baseline (moving average)
+            batch_mean_reward = rewards.mean().item()
+            baseline_deque.append(batch_mean_reward)
+            baseline = float(sum(baseline_deque) / len(baseline_deque))
 
-    # --------------------------------------------------------
-    # Model + optimizer
-    # --------------------------------------------------------
-    model = JITAIPolicyNet(state_dim=train_ds.state_dim)
-    model.to(device)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    loss_fn = nn.CrossEntropyLoss()
-
-    num_epochs = 20
-    best_dev_f1 = 0.0
-
-    # --------------------------------------------------------
-    # Training loop
-    # --------------------------------------------------------
-    for epoch in range(1, num_epochs + 1):
-        print(f"\n===== Epoch {epoch}/{num_epochs} =====")
-        model.train()
-        running_loss = 0.0
-
-        for batch in train_loader:
-            states = batch["state"].to(device)   # [B, state_dim]
-            actions = batch["action"].to(device) # [B]
-
-            logits = model(states)               # [B, 2]
-            loss = loss_fn(logits, actions)
+            # REINFORCE loss: -log pi(a|s) * (R - b)
+            logp = dist.log_prob(actions)  # [B]
+            adv = (rewards - baseline)
+            loss = - (logp * adv).mean()
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             optimizer.step()
 
-            running_loss += loss.item()
+            total_loss += float(loss.item()) * states.size(0)
+            total_reward += float(rewards.sum().item())
+            total_samples += states.size(0)
+            # tally actions under current policy argmax (for reporting)
+            with torch.no_grad():
+                a_pred = probs.argmax(dim=-1)
+                for a in a_pred.cpu().tolist():
+                    action_counts[a] += 1
 
-        avg_loss = running_loss / max(1, len(train_loader))
-        print(f"Train loss: {avg_loss:.4f}")
+        avg_loss = total_loss / (total_samples + 1e-9)
+        avg_reward = total_reward / (total_samples + 1e-9)
+        print(f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_reward={avg_reward:.6f}  baseline={baseline:.4f}")
+        print("Epoch action counts (policy argmax):", action_counts.tolist())
 
-        # ----------------------------------------------------
-        # Dev evaluation
-        # ----------------------------------------------------
-        model.eval()
-        all_preds, all_labels = [], []
+        # simple checkpoint each epoch
+        os.makedirs(os.path.dirname(args.out_model), exist_ok=True)
+        torch.save(policy.state_dict(), args.out_model)
 
-        with torch.no_grad():
-            for batch in dev_loader:
-                states = batch["state"].to(device)
-                actions = batch["action"].to(device)
-
-                logits = model(states)
-                preds = torch.argmax(logits, dim=-1)
-
-                all_preds.extend(preds.cpu().numpy().tolist())
-                all_labels.extend(actions.cpu().numpy().tolist())
-
-        if len(all_labels) == 0:
-            print("WARNING: No dev transitions; skipping dev evaluation.")
-            continue
-
-        dev_acc = (torch.tensor(all_preds) == torch.tensor(all_labels)).float().mean().item()
-        dev_f1 = f1_score(all_labels, all_preds, average="macro")
-
-        print(f"Dev action accuracy: {dev_acc:.4f}")
-        print(f"Dev action macro F1: {dev_f1:.4f}")
-
-        if dev_f1 > best_dev_f1:
-            best_dev_f1 = dev_f1
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "state_dim": train_ds.state_dim,
-                },
-                best_ckpt_path,
-            )
-            print(f"New best policy saved → {best_ckpt_path}")
-
-    print("\nTraining complete.")
-    print("Best Dev action macro F1:", best_dev_f1)
-
-    # --------------------------------------------------------
-    # Final TEST evaluation using best checkpoint
-    # --------------------------------------------------------
-    print("\nLoading best policy for TEST evaluation...")
-    best_ckpt = torch.load(best_ckpt_path, map_location=device)
-    policy = JITAIPolicyNet(state_dim=best_ckpt["state_dim"])
-    policy.load_state_dict(best_ckpt["model_state_dict"])
-    policy.to(device)
+    # final evaluation on dataset: compute policy's action distribution and expected reward under greedy policy
     policy.eval()
-
-    test_ds = MELDJITAITransitionDataset(
-        csv_path=csv_path,
-        splits=("test",),
-        device=str(device),
-    )
-    test_loader = DataLoader(test_ds, batch_size=8, shuffle=False)
-
-    all_labels, all_preds = [], []
+    all_actions = []
+    all_rewards = []
     with torch.no_grad():
-        for batch in test_loader:
-            s = batch["state"].to(device)
-            a_true = batch["action"].cpu().numpy().tolist()
-
-            logits = policy(s)
-            a_pred = logits.argmax(dim=-1).cpu().numpy().tolist()
-
-            all_labels.extend(a_true)
-            all_preds.extend(a_pred)
-
-    print(f"Test action accuracy: {accuracy_score(all_labels, all_preds):.4f}")
-    print(f"Test action macro F1: {f1_score(all_labels, all_preds, average='macro'):.4f}")
-
+        for states, actions, rewards in DataLoader(ds, batch_size=512, collate_fn=collate_batch):
+            states = states.to(device)
+            probs = policy.act_probs(states)
+            greedy = probs.argmax(dim=-1).cpu()
+            all_actions.extend(greedy.tolist())
+            all_rewards.extend(rewards.numpy().tolist())
+    import numpy as np
+    all_actions = np.array(all_actions)
+    print("Final greedy action distribution:", {int(i): int((all_actions==i).sum()) for i in [0,1]})
+    print("Saved policy ->", args.out_model)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv", type=str, default="data/processed/meld_text_audio_video_arcface_states.csv")
+    parser.add_argument("--out_model", type=str, default="models/jitai_policy.pt")
+    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--device", type=str, default="cpu")
+    args = parser.parse_args()
+    train(args)
