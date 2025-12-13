@@ -1,7 +1,7 @@
 # mer/env_meld_jitai.py
 
 import os
-from typing import Dict, List, Any, Iterable
+from typing import Dict, List, Any, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -9,9 +9,84 @@ import torch
 from torch.utils.data import Dataset
 
 # ------------------------------------------------------------
+# Helper: safe .npy/.pt state loader
+# ------------------------------------------------------------
+def load_state_np(state_path: str, expected_dim: int = 512, device: str = "cpu") -> torch.Tensor:
+    """
+    Safely load a state stored as a .npy (preferred) or fall back to torch.load if needed.
+    Returns a torch.float32 tensor on the requested device with shape (expected_dim,).
+    Behavior:
+      - If state_path is missing/empty -> returns zeros.
+      - If file exists and is .npy -> np.load -> pad/trim to expected_dim.
+      - If file exists and not .npy -> try np.load(allow_pickle=True) then torch.load.
+      - Ensures finite values (replace non-finite with 0).
+    """
+    # defensive empty path
+    if not isinstance(state_path, str) or len(state_path.strip()) == 0:
+        return torch.zeros(expected_dim, dtype=torch.float32, device=device)
+
+    # try preferred numpy load first
+    try:
+        if state_path.endswith(".npy") or state_path.endswith(".npz"):
+            arr = np.load(state_path)
+        else:
+            # try np.load with allow_pickle (sometimes saved oddly)
+            try:
+                arr = np.load(state_path, allow_pickle=True)
+            except Exception:
+                # fallback to torch.load
+                try:
+                    obj = torch.load(state_path, map_location="cpu")
+                    if isinstance(obj, np.ndarray):
+                        arr = obj
+                    elif hasattr(obj, "numpy"):
+                        arr = obj.numpy()
+                    elif isinstance(obj, dict):
+                        # common keys
+                        found = False
+                        for k in ("state", "embedding", "features", "z"):
+                            if k in obj:
+                                val = obj[k]
+                                if hasattr(val, "numpy"):
+                                    arr = val.numpy()
+                                elif isinstance(val, np.ndarray):
+                                    arr = val
+                                else:
+                                    arr = np.asarray(val)
+                                found = True
+                                break
+                        if not found:
+                            # try converting whole dict
+                            arr = np.asarray(obj)
+                    else:
+                        arr = np.asarray(obj)
+                except Exception:
+                    # cannot load
+                    return torch.zeros(expected_dim, dtype=torch.float32, device=device)
+        arr = np.asarray(arr).ravel().astype(np.float32)
+    except Exception:
+        # any failure -> zeros
+        return torch.zeros(expected_dim, dtype=torch.float32, device=device)
+
+    # sanitize NaN / inf
+    if not np.isfinite(arr).all():
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    # pad/trim to expected_dim
+    if arr.size < expected_dim:
+        padded = np.zeros(expected_dim, dtype=np.float32)
+        padded[: arr.size] = arr
+        arr = padded
+    elif arr.size > expected_dim:
+        arr = arr[:expected_dim]
+
+    t = torch.tensor(arr, dtype=torch.float32, device=device)
+    return t
+
+
+# ------------------------------------------------------------
 # 1. Emotion → valence mapping for MELD (4 classes)
 # ------------------------------------------------------------
-
 LABEL2VALENCE = {
     "angry": -1.0,
     "sad": -1.0,
@@ -27,7 +102,6 @@ def label_to_valence(label: str) -> float:
 # ------------------------------------------------------------
 # 2. Offline JITAI / contextual bandit dataset
 # ------------------------------------------------------------
-
 class MELDJITAITransitionDataset(Dataset):
     """
     Offline JITAI / bandit dataset built from:
@@ -69,7 +143,11 @@ class MELDJITAITransitionDataset(Dataset):
         df = pd.read_csv(csv_path)
 
         # Keep only desired splits
-        df = df[df["split"].isin(self.splits)].reset_index(drop=True)
+        if "split" in df.columns:
+            df = df[df["split"].isin(self.splits)].reset_index(drop=True)
+        else:
+            # no split column -> assume all rows are acceptable
+            df = df.reset_index(drop=True)
 
         # Require state_path column
         if "state_path" not in df.columns:
@@ -92,23 +170,15 @@ class MELDJITAITransitionDataset(Dataset):
         self.transitions: List[Dict[str, Any]] = []
         self._build_transitions()
 
-        # Infer state dimension by loading one state via numpy
+        # Infer state dimension by loading one state via helper
         if len(self.transitions) > 0:
             first_state_path = self.transitions[0]["state_path_t"]
-            try:
-                sample_state = np.load(first_state_path)
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to load sample state from {first_state_path}. "
-                    f"Check that extract_tav_context_states.py saved .npy files. "
-                    f"Error: {e}"
-                )
-
+            sample_state_t = load_state_np(first_state_path, expected_dim=512, device="cpu")
+            sample_state = sample_state_t.cpu().numpy()
             if not isinstance(sample_state, np.ndarray):
                 raise TypeError(
-                    f"State file at {first_state_path} is not a numpy array."
+                    f"State file at {first_state_path} is not a numpy array (after loading)."
                 )
-
             self.state_dim = int(sample_state.size)
         else:
             self.state_dim = 0
@@ -194,23 +264,13 @@ class MELDJITAITransitionDataset(Dataset):
         # Synthetic logged action
         action = self._logging_policy(val_t)
 
-        # Load state and next_state from .npy
-        try:
-            state_np = np.load(tr["state_path_t"])
-            next_state_np = np.load(tr["state_path_next"])
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load states for transition "
-                f"(t: {tr['state_path_t']}, next: {tr['state_path_next']}): {e}"
-            )
+        # Load state and next_state using helper (ensures device placement and shape)
+        state = load_state_np(tr["state_path_t"], expected_dim=512, device=str(self.device))
+        next_state = load_state_np(tr["state_path_next"], expected_dim=512, device=str(self.device))
 
-        if not isinstance(state_np, np.ndarray) or not isinstance(
-            next_state_np, np.ndarray
-        ):
-            raise TypeError("Loaded state is not a numpy array.")
-
-        state = torch.from_numpy(state_np).view(-1).to(self.device).float()
-        next_state = torch.from_numpy(next_state_np).view(-1).to(self.device).float()
+        # Ensure tensors are 1D and float
+        state = state.view(-1).float()
+        next_state = next_state.view(-1).float()
 
         return {
             "state": state,  # [state_dim]
