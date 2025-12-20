@@ -136,5 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--device", type=str, default="cpu")
+
+
     args = parser.parse_args()
     train(args)

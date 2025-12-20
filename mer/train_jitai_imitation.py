@@ -69,7 +69,11 @@ def train(args):
     model = BCPolicy(input_dim=ds.state_dim, hidden_dim=args.hidden).to(device)
 
     opt = optim.Adam(model.parameters(), lr=args.lr)
-    loss_fn = nn.CrossEntropyLoss()
+    # compute class weights manually
+    # penalize action=1 dominance
+    class_weights = torch.tensor([1.0, 10.0])  # [no_intervene, intervene]
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights.to(device))
+
 
     print("Train size:", train_size, "Val size:", val_size, "State dim:", ds.state_dim)
 
