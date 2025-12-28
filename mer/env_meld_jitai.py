@@ -504,23 +504,60 @@ class MELDJITAITransitionDataset(Dataset):
 # ------------------------------------------------------------
 # Demo
 # ------------------------------------------------------------
+# if __name__ == "__main__":
+#     this_dir = os.path.dirname(os.path.abspath(__file__))
+#     project_root = os.path.dirname(this_dir)
+
+#     csv_path = os.path.join(
+#         project_root, "data", "processed", "meld_text_audio_video_arcface_states.csv"
+#     )
+
+#     ds = MELDJITAITransitionDataset(
+#     csv_path=args.csv,
+#     splits=("train",),
+#     device=args.device,
+#     reward_mode=args.reward_mode,  # <-- THIS LINE WAS MISSING OR WRONG
+# )
+
+
+#     print("Transitions:", len(ds))
+#     if len(ds) > 0:
+#         s = ds[0]
+#         print("Sample reward:", s["reward"].item())
 if __name__ == "__main__":
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(this_dir)
+    import os
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     csv_path = os.path.join(
-        project_root, "data", "processed", "meld_text_audio_video_arcface_states.csv"
+        project_root,
+        "data",
+        "processed",
+        "meld_text_audio_video_arcface_states.csv",
     )
 
-    ds = MELDJITAITransitionDataset(
-    csv_path=args.csv,
-    splits=("train",),
-    device=args.device,
-    reward_mode=args.reward_mode,  # <-- THIS LINE WAS MISSING OR WRONG
-)
+    print("[env_meld_jitai] CSV:", csv_path)
 
+    train_ds = MELDJITAITransitionDataset(
+        csv_path=csv_path,
+        splits=("train",),
+        device="cpu",
+    )
 
-    print("Transitions:", len(ds))
-    if len(ds) > 0:
-        s = ds[0]
-        print("Sample reward:", s["reward"].item())
+    dev_ds = MELDJITAITransitionDataset(
+        csv_path=csv_path,
+        splits=("dev",),
+        device="cpu",
+    )
+
+    test_ds = MELDJITAITransitionDataset(
+        csv_path=csv_path,
+        splits=("test",),
+        device="cpu",
+    )
+
+    print("\nSummary:")
+    print("Train transitions:", len(train_ds))
+    print("Dev transitions:  ", len(dev_ds))
+    print("Test transitions: ", len(test_ds))
+    print("State dim:", train_ds.state_dim)
