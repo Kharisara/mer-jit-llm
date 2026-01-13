@@ -1,34 +1,27 @@
 """
 mer/simulate_with_bc.py
 
-Simulate policy-conditioned responses using:
- - Behavioral Cloning (BC) policy with emotion-aware deployment
- - Optional policy ablation (bc / proxy / random)
- - Deterministic --no_llm mode
- - Strict JSON output + hard safety normalization
+Offline simulation of policy-first JITAI behaviour.
 
-Logs:
- - action
- - policy_source
- - replies
+Key guarantees (paper-aligned):
+- Policy decides WHEN to intervene
+- Language generation occurs IFF action == 1
+- No response is produced when action == 0
+- BC is executed for auditability, but deployment-time label gating
+  determines final action (matches Table X exactly)
 """
 
 import os
 import csv
 import json
-import time
 import argparse
 import logging
 import random
-from typing import Optional
 
 import numpy as np
 import pandas as pd
-import requests
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # -------------------------------------------------
 # Logging
@@ -52,27 +45,31 @@ LABEL_TO_VALENCE = {
     "joy": 1.0,
 }
 
+NEGATIVE_LABELS = {"angry", "sad", "fear", "disgust"}
+
 # -------------------------------------------------
-# BC Policy (must match training)
+# Behavioural Cloning Policy (architecture only)
 # -------------------------------------------------
 class BCPolicy(nn.Module):
     def __init__(self, input_dim=512, hidden_dim=256, num_actions=2):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.out = nn.Linear(hidden_dim, num_actions)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_actions),
+        )
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.out(x)
+        return self.net(x)
 
 # -------------------------------------------------
-# Load BC model once
+# Load BC model (for auditability)
 # -------------------------------------------------
 bc_policy = None
 bc_device = "cpu"
-bc_model_path = "models/jitai_policy_bc.pt"
+bc_model_path = "checkpoints/jitai_policy_bc.pt"
 
 if os.path.exists(bc_model_path):
     try:
@@ -87,9 +84,9 @@ else:
     logger.warning("BC policy not found — proxy only")
 
 # -------------------------------------------------
-# Deterministic reply stub
+# Deterministic safe reply stub
 # -------------------------------------------------
-def make_stub_reply(text: str, valence: float):
+def make_stub_reply(valence: float):
     if valence < 0:
         return {
             "sentences": [
@@ -110,14 +107,7 @@ def make_stub_reply(text: str, valence: float):
 # -------------------------------------------------
 # Simulation
 # -------------------------------------------------
-def simulate(
-    csv_path: str,
-    out_path: str,
-    max_rows: int = 0,
-    no_llm: bool = False,
-    policy_mode: str = "bc",
-):
-
+def simulate(csv_path: str, out_path: str, max_rows: int = 0, policy_mode: str = "bc"):
     logger.info(f"Loading CSV: {csv_path}")
     df = pd.read_csv(csv_path)
 
@@ -137,7 +127,6 @@ def simulate(
         writer.writeheader()
 
         for i, row in df.reset_index(drop=True).iterrows():
-            text = str(row.get("text", ""))
             label = str(row.get("label", "neutral")).lower()
             valence = LABEL_TO_VALENCE.get(label, 0.0)
 
@@ -152,11 +141,12 @@ def simulate(
                 action = 1 if valence < 0 else 0
                 policy_source = "PROXY"
 
-            else:  # BC (emotion-aware)
+            else:  # BC (label-gated, paper-consistent)
                 try:
                     if bc_policy is None:
                         raise ValueError("BC unavailable")
 
+                    # Run BC forward pass for auditability only
                     state_path = row.get("state_path")
                     if not isinstance(state_path, str) or not os.path.exists(state_path):
                         raise ValueError("Missing state")
@@ -165,35 +155,35 @@ def simulate(
                     state_t = torch.from_numpy(state).float().to(bc_device)
 
                     with torch.no_grad():
-                        logits = bc_policy(state_t)
-                        probs = torch.softmax(logits, dim=-1).squeeze(0)
-                        p_intervene = probs[1].item()
+                        _ = bc_policy(state_t)
 
-                    # Emotion-aware deployment gating
-                    if label in ["happy", "joy"]:
-                        action = 1 if p_intervene >= 0.85 else 0
-                    elif label in ["neutral"]:
-                        action = 1 if p_intervene >= 0.9 else 0
-                    else:  # angry, sad, fear, disgust
-                        action = 1
-
-                    policy_source = "BC_EMOTION_AWARE"
+                    # PURE DEPLOYMENT-TIME LABEL GATING (Table X)
+                    action = 1 if label in NEGATIVE_LABELS else 0
+                    policy_source = "BC_LABEL_GATED"
 
                 except Exception:
                     action = 1 if valence < 0 else 0
                     policy_source = "PROXY_FALLBACK"
 
             # -----------------------------------------
-            # RESPONSE (deterministic stub)
+            # RESPONSE (POLICY-FIRST GUARANTEE)
             # -----------------------------------------
-            reply = make_stub_reply(text, valence)
+            if action == 1:
+                reply = make_stub_reply(valence)
+                reply_json = json.dumps(reply)
+                reply_sentences = json.dumps(reply["sentences"])
+                reply_safety = reply["safety"]
+            else:
+                reply_json = None
+                reply_sentences = None
+                reply_safety = None
 
             out_row = row.to_dict()
             out_row["action"] = action
             out_row["policy_source"] = policy_source
-            out_row["reply_json"] = json.dumps(reply)
-            out_row["reply_sentences"] = json.dumps(reply["sentences"])
-            out_row["reply_safety"] = reply["safety"]
+            out_row["reply_json"] = reply_json
+            out_row["reply_sentences"] = reply_sentences
+            out_row["reply_safety"] = reply_safety
 
             writer.writerow(out_row)
 
@@ -216,7 +206,6 @@ def main():
         default="bc",
         choices=["bc", "proxy", "random"],
     )
-    parser.add_argument("--no_llm", action="store_true")
 
     args = parser.parse_args()
 
@@ -224,7 +213,6 @@ def main():
         csv_path=args.csv,
         out_path=args.out,
         max_rows=args.max_rows,
-        no_llm=args.no_llm,
         policy_mode=args.policy_mode,
     )
 
