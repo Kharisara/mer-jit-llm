@@ -3,7 +3,8 @@ run_full_reproduction.py
 
 Reproduction runner for the Policy-First JITAI Architecture experiments.
 
-Pipeline:
+Pipeline
+--------
 1. Train policy using train_jitai_policy.py
 2. Run policy-first offline replay (BC policy)
 3. Run proxy logging policy replay
@@ -11,7 +12,8 @@ Pipeline:
 5. Run deterministic replay verification
 6. Print summary statistics
 
-Outputs:
+Outputs
+-------
 CSV files stored in paper_outputs/
 """
 
@@ -19,6 +21,22 @@ import os
 import sys
 import subprocess
 import pandas as pd
+import random
+import numpy as np
+
+# -------------------------------------------------
+# DETERMINISTIC SEED CONTROL
+# -------------------------------------------------
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+try:
+    import torch
+    torch.manual_seed(SEED)
+except Exception:
+    pass
 
 
 # -------------------------------------------------
@@ -38,7 +56,7 @@ PROXY_OUT = os.path.join(OUTPUT_DIR, "proxy_outputs.csv")
 E2E_OUT = os.path.join(OUTPUT_DIR, "e2e_outputs.csv")
 STRESS_OUT = os.path.join(OUTPUT_DIR, "stress_outputs.csv")
 
-MAX_ROWS = None   # set integer for quick tests
+MAX_ROWS = None  # set integer for quick tests
 
 
 # -------------------------------------------------
@@ -47,9 +65,13 @@ MAX_ROWS = None   # set integer for quick tests
 
 def ensure_dirs():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print("[INFO] Output directory:", OUTPUT_DIR)
 
 
 def run_cmd(cmd):
+
+    print("[CMD]", " ".join(cmd))
+
     subprocess.run(cmd, check=True)
 
 
@@ -87,16 +109,16 @@ def run_policy_first():
     print("\n[STEP 2] Running policy-first replay")
 
     cmd = [
-        sys.executable,
-        "-m",
-        "mer.simulate_with_bc",
-        "--csv",
-        DATASET_CSV,
-        "--out",
-        POLICY_FIRST_OUT,
-        "--policy_mode",
-        "bc"
-    ]
+    sys.executable,
+    "-m",
+    "mer.simulate_with_bc",
+    "--csv",
+    DATASET_CSV,
+    "--out",
+    STRESS_OUT,
+    "--policy_mode",
+    "bc"
+]
 
     if MAX_ROWS:
         cmd += ["--max_rows", str(MAX_ROWS)]
@@ -166,16 +188,16 @@ def run_stress_test():
     print("\n[STEP 5] Running deterministic replay check")
 
     cmd = [
-        sys.executable,
-        "-m",
-        "mer.simulate_with_bc",
-        "--csv",
-        DATASET_CSV,
-        "--out",
-        STRESS_OUT,
-        "--policy_mode",
-        "bc"
-    ]
+    sys.executable,
+    "-m",
+    "mer.simulate_with_bc",
+    "--csv",
+    DATASET_CSV,
+    "--out",
+    POLICY_FIRST_OUT,
+    "--policy_mode",
+    "bc"
+]
 
     run_cmd(cmd)
 
