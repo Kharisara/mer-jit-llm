@@ -84,24 +84,33 @@ https://affective-meld.github.io/
 
 Due to licensing and size constraints, the dataset and its processed representations are not included in this repository.
 
-Dataset Preparation (Required):-
+ataset
 
-Download the MELD dataset from:
+Experiments are conducted using the MELD dataset (Multimodal EmotionLines Dataset), available at:
+
+https://affective-meld.github.io/
+
+Due to dataset usage terms and size constraints, the dataset and its processed representations are not included in this repository.
+
+# Dataset Preparation
+Download the dataset from:
 https://affective-meld.github.io/
 
 Place the dataset in:
 data/raw/
 
-Run preprocessing:
-python preprocess.py
+Prepare the dataset using the provided scripts:
+python reorganize_meld_frames.py
+python extract_tav_context_states.py
+python precompute_meld_video_embeddings.py
 
-This will generate the required processed representations in:
-data/processed/
+These steps prepare the multimodal inputs required for training and evaluation.
+Refer to the individual scripts for configuration details.
 
-Notes
-1.Full reproduction of experimental results requires access to the MELD dataset.
-2.Ensure the dataset is correctly placed and preprocessed before running the pipeline.
-3.The repository provides all necessary code for evaluation, but not the dataset itself.
+# Notes
+Full reproduction of experimental results requires access to the MELD dataset
+Ensure the dataset is correctly prepared before running the pipeline
+The repository provides all necessary code for evaluation, but not the dataset itself
 ---
 
 # License
