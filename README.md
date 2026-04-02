@@ -78,10 +78,28 @@ All experiments use fixed random seeds and deterministic offline replay ordering
 
 # Dataset
 
-Experiments are conducted using processed MELD state representations included in:
+Experiments are conducted using the MELD dataset (Multimodal EmotionLines Dataset), which is publicly available at:
+
+https://affective-meld.github.io/
+
+Due to licensing and size constraints, the dataset and its processed representations are not included in this repository.
+
+Dataset Preparation (Required):-
+
+Download the MELD dataset from:
+https://affective-meld.github.io/
+Place the dataset in:
+data/raw/
+Run preprocessing:
+python preprocess.py
+
+This will generate the required processed representations in:
 
 data/processed/
-
+Notes
+Full reproduction of experimental results requires access to the MELD dataset.
+Ensure the dataset is correctly placed and preprocessed before running the pipeline.
+The repository provides all necessary code for evaluation, but not the dataset itself.
 ---
 
 # License
