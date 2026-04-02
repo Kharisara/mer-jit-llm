@@ -88,18 +88,20 @@ Dataset Preparation (Required):-
 
 Download the MELD dataset from:
 https://affective-meld.github.io/
+
 Place the dataset in:
 data/raw/
+
 Run preprocessing:
 python preprocess.py
 
 This will generate the required processed representations in:
-
 data/processed/
+
 Notes
-Full reproduction of experimental results requires access to the MELD dataset.
-Ensure the dataset is correctly placed and preprocessed before running the pipeline.
-The repository provides all necessary code for evaluation, but not the dataset itself.
+1.Full reproduction of experimental results requires access to the MELD dataset.
+2.Ensure the dataset is correctly placed and preprocessed before running the pipeline.
+3.The repository provides all necessary code for evaluation, but not the dataset itself.
 ---
 
 # License
