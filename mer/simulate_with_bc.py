@@ -475,6 +475,15 @@ def make_stub_reply(valence: float):
             "safety": "ok",
         }
 
+def fallback_reply():
+    return {
+        "sentences": [
+            "I'm here with you.",
+            "Let's take a moment to pause and breathe."
+        ],
+        "safety": "fallback",
+    }
+
 # -------------------------------------------------
 # Offline simulation
 # -------------------------------------------------
