@@ -4,115 +4,205 @@ This repository contains the reproducibility pipeline for the paper:
 
 **A Policy-First Architecture for Offline Systems Validation of Emotion-Aware Conversational AI**
 
-The code reproduces the offline evaluation experiments reported in the paper using deterministic replay over the MELD dataset.
+The repository reproduces the deterministic offline replay experiments reported in the paper using the MELD dataset.
 
 ---
 
 # Requirements
 
-Python 3.10+
+* Python 3.10+
+* Recommended: virtual environment
 
-It is recommended to run the code inside a virtual environment.
+Create a virtual environment:
 
-Create and activate a virtual environment:
-
+```bash
 python -m venv .venv
+```
 
-Activate (Windows):
+Activate on Windows:
 
+```bash
 .venv\Scripts\activate
+```
 
-Activate (Linux/Mac):
+Activate on Linux/Mac:
 
+```bash
 source .venv/bin/activate
+```
 
 Install dependencies:
 
+```bash
 pip install -r requirements.txt
+```
+
+---
 
 # Running the Full Reproduction Pipeline
 
-All experiments can be reproduced using the following command:
+Run the full reproduction pipeline:
 
+```bash
 python run_full_reproduction.py
+```
 
-(Alternatively, on systems with `make` installed)
+Optional quick test:
 
-make reproduce
+```bash
+python run_full_reproduction.py --max_rows 500
+```
 
----
+Optional skip of BC training:
 
-# Pipeline Steps
-
-The reproduction pipeline performs the following steps automatically:
-
-1. Train the behavioural cloning policy
-2. Run policy-first offline replay
-3. Run proxy logging policy replay
-4. Run end-to-end LLM baseline simulation
-5. Run deterministic replay verification
-6. Produce summary statistics
+```bash
+python run_full_reproduction.py --skip_train
+```
 
 ---
 
-# Output Files
+# Pipeline Overview
 
-All generated outputs are stored in:
+The reproduction pipeline performs the following steps:
 
+1. Train the behavioral cloning (BC) policy
+2. Run learned BC policy replay
+3. Run deterministic proxy replay
+4. Generate random baseline outputs
+5. Generate deployment-time gated outputs
+6. Run optional unconstrained end-to-end baseline
+7. Run deterministic replay robustness assessment
+8. Generate manuscript-ready Tables II–IX
+9. Produce summary statistics and execution manifests
+
+---
+
+# Output Structure
+
+## Raw Replay Outputs
+
+Generated in:
+
+```text
 paper_outputs/
+```
 
-The main outputs are:
+Main files:
 
-- `policy_first_outputs.csv` — policy-first architecture replay
-- `proxy_outputs.csv` — proxy logging baseline
-- `e2e_outputs.csv` — end-to-end LLM baseline
-- `stress_outputs.csv` — deterministic replay verification
+* `policy_first_outputs_bc.csv`
+
+  * Learned behavioral cloning replay output
+  * Used for intervention-policy learnability analysis
+
+* `policy_first_outputs_proxy.csv`
+
+  * Deterministic proxy replay output
+  * Used for architectural validation and robustness analysis
+
+* `random_outputs.csv`
+
+  * Deterministic random baseline output
+
+* `gated_outputs.csv`
+
+  * Deployment-time gated policy output
+
+* `e2e_outputs.csv`
+
+  * Optional unconstrained end-to-end baseline output
+
+---
+
+## Manuscript Tables
+
+Generated in:
+
+```text
+paper_tables/
+```
+
+Generated manuscript-ready tables:
+
+* `table_ii_rl_diagnostic.csv`
+* `table_iii_proxy_execution.csv`
+* `table_iv_aggregate_behavior.csv`
+* `table_v_representation_ablation.csv`
+* `table_vi_emotion_conditioned.csv`
+* `table_vii_robustness.csv`
+* `table_viii_architectural_comparison.csv`
+* `table_ix_summary.csv`
+
+---
+
+## Robustness Outputs
+
+Generated in:
+
+```text
+robustness_results/
+```
+
+Contains deterministic replay robustness assessment results.
 
 ---
 
 # Deterministic Reproducibility
 
-All experiments use fixed random seeds and deterministic offline replay ordering to ensure identical results across runs.
+All experiments use:
+
+* fixed random seeds,
+* deterministic replay ordering,
+* fixed logged conversational trajectories.
+
+Under identical software and dataset conditions, the replay pipeline is expected to produce identical execution behavior across runs.
 
 ---
 
 # Dataset
 
-Experiments are conducted using the MELD dataset (Multimodal EmotionLines Dataset), which is publicly available at:
+Experiments use the MELD dataset (Multimodal EmotionLines Dataset):
 
 https://affective-meld.github.io/
 
-Due to licensing and size constraints, the dataset and its processed representations are not included in this repository.
+The dataset and processed representations are not included in this repository due to licensing and storage constraints.
 
-ataset
-
-Experiments are conducted using the MELD dataset (Multimodal EmotionLines Dataset), available at:
-
-https://affective-meld.github.io/
-
-Due to dataset usage terms and size constraints, the dataset and its processed representations are not included in this repository.
+---
 
 # Dataset Preparation
-Download the dataset from:
+
+Download MELD from:
+
 https://affective-meld.github.io/
 
-Place the dataset in:
-data/raw/
+Place the raw dataset in:
 
-Prepare the dataset using the provided scripts:
+```text
+data/raw/
+```
+
+Prepare the dataset using:
+
+```bash
 python reorganize_meld_frames.py
 python extract_tav_context_states.py
 python precompute_meld_video_embeddings.py
+```
 
-These steps prepare the multimodal inputs required for training and evaluation.
+These scripts generate the multimodal state representations required for training and deterministic offline replay.
+
 Refer to the individual scripts for configuration details.
 
+---
+
 # Notes
-Full reproduction of experimental results requires access to the MELD dataset
-Ensure the dataset is correctly prepared before running the pipeline
-The repository provides all necessary code for evaluation, but not the dataset itself
+
+* Full reproduction requires access to the MELD dataset.
+* Ensure dataset preprocessing is completed before running the pipeline.
+* The repository reproduces execution-level architectural validation experiments under deterministic offline replay.
+* The repository does not provide real clinical intervention evaluation or human-subject assessment.
+
 ---
 
 # License
 
-This code is released for research reproducibility purposes.
+Released for research reproducibility purposes.
