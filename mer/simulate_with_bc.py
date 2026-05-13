@@ -560,18 +560,24 @@ def simulate(csv_path: str, out_path: str, max_rows: int = 0, policy_mode: str =
                         .to(bc_device)
                     )
 
-                    # Forward pass for auditability only
-                    with torch.no_grad():
-                        _ = bc_policy(state_t)
+                    # # Forward pass for auditability only
+                    # with torch.no_grad():
+                    #     _ = bc_policy(state_t)
 
-                    # FINAL EXECUTION DECISION
-                    action = 1 if label in NEGATIVE_LABELS else 0
+                    # # FINAL EXECUTION DECISION
+                    # action = 1 if label in NEGATIVE_LABELS else 0
                     policy_source = "BC_LABEL_GATED"
+                    # Behavioural cloning policy decision
+                    with torch.no_grad():
+                        logits = bc_policy(state_t)
+                        action = int(torch.argmax(logits, dim=1).item())
+                    policy_source = "BC"
 
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"BC replay failed at row {i}: {e}")
                     action = 1 if valence < 0 else 0
                     policy_source = "PROXY_FALLBACK"
-
+                
             # -----------------------------------------
             # POLICY-FIRST GUARANTEE
             # -----------------------------------------
